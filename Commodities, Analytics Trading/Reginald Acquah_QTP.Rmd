@@ -1,0 +1,672 @@
+---
+title: "Trading Wells Fargo Stocks With Dividend and Interest Rate Signals"
+author: "Reginald Acquah"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r include=FALSE}
+knitr::opts_chunk$set(echo = T,warning = F,message = F, fig.width = 7, fig.height = 4,fig.align = "center",tidy = FALSE, strip.white = TRUE)
+```
+
+```{r Libraries, include=FALSE}
+options("getSymbols.warning4.0" = FALSE)
+library(tidyverse)
+library(tidyquant)
+library(timetk)
+library(TTR)
+library(PerformanceAnalytics)
+library(tools)
+library(foreach)
+library(doParallel)
+library(tsibble)
+```
+### Strategy
+Our strategy in this project is to trade Wells Fargo stocks based on dividend and interest rate changes
+
+### Wells Fargo
+WFC is the symbol for Wells Fargo stocks. Wells Fargo provides banking and financial products and services for individual consumers, small and middle-market businesses, institutional investors, large corporations, and governments worldwide.
+
+### Factors that Determine the Price of WFC
+Stock prices are mainly driven by investor demand. Stock prices rise when buy numbers exceed sell orders and vice versa. Generally, demand factors fall under economy, earnings and expectations. 
+
+For a financial institution like Wells Fargo, the drivers of its stock price will reflect the current health of the underlying business and its future growth potential. Therefore, to evaluate the share price of WFC, the following factors are vital:
+
++ Demand for banking services
++ Bank's growth potential
++ Economic conditions
++ Bank's earnings
++ Sentiments and expectations about the future
+
+#### Research and Rationale
+We will trade WFC based on the demand for banking services, potential growth and economic conditions. These factors will be captured by interest rate in the USA and dividend changes of Wells Fargo.
+
+**Interest Rate**
+
+The Federal Reserve is in charge of monetary policy for the U.S., and the Federal Open Market Committee (FOMC) is the committee that decides how to manage monetary policy. The FOMC conventionally meets eight times a year, which translates to about once every six weeks to debate interest rates, and vote on policies. However, the FOMC can have more meets than the regular when the need arises. Prior to FOMC, players in the market form their view about the direction in which interest rates are likely to move. This is mostly based on inflation rates as the FOMC uses the interest rate to target inflation rates.
+
+For interest rate, we will use the Federal Funds Target Rate as a proxy for interest rates to capture the demand for banking services and economic condition factors. The Fed increases interest rates as a contractionary policy. Although an increase in interest rate affects consumer spending negatively extending to other sectors of the economy, banks tend to benefit from interest rate hikes. This is because the banks can charge more on lending hence increase their earnings. 
+We will therefore buy WFC when the change in interest rate is positive and sell when change in interest rate is negative. This strategy is likely to work when banks are responsive to changes in federal funds target rate in both directions.  
+
+**Dividends**
+
+Dividends are commonly paid out annually or quarterly, but some are paid monthly. There are four key dates associated to dividends:
+
++ *Declaration date*
+  
+  This is the date the board of directors announces and declares dividend
+  
++ *Ex-dividend date*
+  
+  This is the cut-off day for being eligible to receive the dividend payment
+  
++ *Date of record*
+  
+  This is the day when a company records which shareholders as eligible to receive the dividend
+  
++ *Pay date*
+  
+  The day when the dividend is paid and the company issues dividend payments
+
+For Wells Fargo dividends are paid on quarterly basis. Dividend declaration date is on the Tuesday prior to the next week or tow weeks Thursday which is the ex-dividend date. That is there are 6 to 11 business between the declaration date and ex-dividend date. [Wells Fargo key dividend dates](https://www.streetinsider.com/dividend_history.php?q=WFC) 
+
+An increase in dividend payouts implies that the bank has a growth potential. This growth potential therefore predicts a favorable performance of the stock in the future. Based on the dividend signals, we will buy WFC when the change in dividend is positive and sell WFC when the change in dividend is negative. Our strategy may fail if Wells Fargo either reduces the frequency of dividend declaration or maintain the dividends paid out from the prior quarter even when they experience growth. 
+
+Finally, we will combine the various strategies and determine the optimal parameters for our model.
+
+To test the robustness of our model, we perform backtesting using the walk forward approach. Also, we test our model on the SPDR S&P Regional Banking ETF (KRE) since the factors that model is based on are related to the financial services. The S&P Regional Banks Select Industry Index (the “Index”) represents the regional banks segment of the S&P Total Market Index. 
+
+
+### Data
+We get WFC stock prices and dividend information from yahoo finance. The dividend dates provided in corresponds to the ex-date. Federal Funds Target Rate is used to capture USA interest rate. We get the data from FRED by combining  Federal Funds Target Rate (discontinued in 2008) with  Federal Funds Target Rate - Upper limit. Daily data is taken from January 1, 1990 to current date. For the purposes of modeling, we use approximately 80% of the data as our training set. That is data up to 2014. 
+
+
+```{r Data, include=FALSE}
+window <- c(from = "1990-01-01", to = "2014-12-01")
+stock <- "WFC"
+int <- c( "DFEDTAR","DFEDTARU") 
+
+#Get WFC OHLC data
+df.stock <- tq_get(stock, "stock.prices",
+               from = window[1]) %>%
+  dplyr::rename_all(tools::toTitleCase) %>% 
+  timetk::tk_xts(date_var = Date)
+
+#Adjust OHLC prices
+quantmod::getSymbols(stock)
+df.stock <- quantmod::adjustOHLC(df.stock, use.Adjusted = T)
+
+#Get dividend data
+df.dividend <- tq_get(stock, "dividends",
+               from = window[1]) %>% 
+  dplyr::rename(Dividend = value) %>% 
+  dplyr::select(-symbol) %>% 
+  timetk::tk_xts(date_var = Date)
+
+#Get Federal Funds rate from FRED
+df.int <- tq_get(int, "economic.data",
+               from = window[1]) %>%
+  dplyr::rename(Interest = price) %>% 
+  dplyr::select(-symbol) %>% 
+  timetk::tk_xts(date_var = Date)
+
+#Merge all 3 dataset
+WFC <- df.stock %>% merge.xts(df.dividend, join = "outer") %>% 
+  merge.xts(df.int, join = "left")
+WFC <- zoo::na.locf(WFC) #Forward fill dividends
+WFC <-zoo::na.trim(WFC)
+
+# Subset Training Set
+WFC.train <-
+  WFC[zoo::index(WFC) >= window["from"] & zoo::index(WFC) <= window["to"],]
+
+```
+
+
+```{r Data Prep Function, include=FALSE}
+test.data <- function(data = data, from = from, to = to){
+  train <- c(from = from, to = to)
+  df <- data[zoo::index(data) >= train["from"] & zoo::index(data) <= train["to"],]
+  
+  df$retClCl <-
+  stats::na.omit(quantmod::Delt(quantmod::Cl(df), k = 1, type = 'arithmetic'))
+  
+  df$retOpCl <-
+  stats::na.omit(quantmod::Delt(
+    quantmod::Op(df),
+    quantmod::Cl(df),
+    k = 0,
+    type = 'arithmetic'
+  ))
+  
+  df$retClOp <-
+  stats::na.omit(quantmod::Delt(
+    quantmod::Cl(df),
+    quantmod::Op(df),
+    k = 1,
+    type = 'arithmetic'
+  ))
+  
+  return(df)
+}
+```
+
+### Model Implementation
+The model is based on the dividend and interest rate changes. Due to the sensitivity of the financial market to time, our model is developed to capture the optimal time to enter and exit a trade.
+
+For the dividend, we formulate the model to predict the optimal day to enter a trade after the declaration date. We earlier stated that declaration date for Wells Fargo is 6 to 13 business day prior to the ex-date. Therefore our decision to long or short Wells Fargo dividend should lie between the 13 days of ex-date. Hence, we model the `div_lead` parameter which determines the optimal day to enter the transaction on or before the ex-date. 
+
+Also, the model will have to predict when we have to get out of the trade before the next quarterly announcement. With 253 trading days in a year, we get 63 days in a quarter and include a margin of 5 days before and after. That is we iterate between 58 and 68 to determine the optimal number of days to stay in the trade. This parameter is labelled `div_lag` in our model.   
+
+The parameters related to interest rate are `int_lead` and `int_lag`. Similar to the dividends, we find the optimal day prior to interest rate announcement and put in a trade. Here, we assume that our expectation of interest rate change is in line with FOMC announcement. However, during implementation of the model, we will have to predict changes in expected interest rate to execute our trade. Since FOMC meeting days is public knowledge, we iterate between 1 to 5 trading days to obtain the optimal day (`int_lead`) to execute the trade. 
+
+Also, we predict the optimal day to get out of trade based on interest rate. Changes in interest rate have a transient effect on the market. Therefore we assume that the market will adjust to changes in interest rate with 5 trading days. Hence, we iterate between the 0 to 5 days to obtain the optimal parameter for `int_lag`.
+
+### Signal Indicators and Trade Rules
+Trade signals are generated based on changes in dividends and interest rate. As stated earlier, dividend growth signals growth potential. As such, we buy WFC stocks when the change in dividend is positive and sell when the change is negative. That is, we issue a signal 1 when change in dividend is greater than 0 and a signal -1 when the change is negative. In the case where there's no change we issue a signal 0 which means we do nothing. As described earlier, we determine the optimal day to exit the trade. For the exit signals, we issue a signal of -1 if the preceding signal was 1 and 1 if the preceding signal was -1. We exit at the optimal time when the market have adjusted to dividend changes.
+
+Similarly, we issue a signal of 1 to buy WFC stocks when interest rate are expected to increase. This is in accordance with the literature that banks benefit from interest rate hikes. A signal of -1 is entered when we initially buy WFC at an earlier day. Conversely, a signal of -1 (sell) is issued when we expect interest rates to fall. Again we issue a signal of 1 to get out of this trade. 
+
+
+### Trade Execution
+After signals have been detected, we enter the trade on the next trading day and hold onto the position until the exit period. 
+
+**Assumptions**
+
+- We assume that there are no transaction cost associated with the trade.
+- We assume that short selling is possible.
+- We assume that our prediction for interest rate changes are accurate.
+
+```{r Strategy, include=FALSE}
+strategy <- function(Data = Data, 
+                     div_lead = div_lead,
+                     div_lag = div_lag,
+                     int_lead = int_lead, 
+                     int_lag = int_lag){
+  #Signal Indicators
+  Data$Div_Change <- quantmod::Delt(Data$Dividend, k=1, type = 'arithmetic')
+  Data$Int_Change <- quantmod::Delt(Data$Interest, k=1, type = 'arithmetic')
+
+  
+  Data$signal.Int <- case_when(stats::lag(Data$Int_Change, k = -int_lead)  > 0  ~ 1, stats::lag(Data$Int_Change, k = -int_lead) < 0  ~ -1, TRUE ~ 0)
+  Data$signal.Int.lag <- case_when(Data$Int_Change  > 0  ~ -1, Data$Int_Change < 0  ~ 1, TRUE ~ 0)
+  Data$signal.Int.lag <- stats::lag(Data$signal.Int.lag, k = int_lag)
+  Data$signal.Int.lag <- na.fill(Data$signal.Int.lag, fill = 0)
+  
+
+  Data$signal.Div <- case_when(stats::lag(Data$Div_Change, k = -div_lead)  > 0  ~ 1, stats::lag(Data$Div_Change, k = -div_lead) < 0  ~ -1, TRUE ~ 0)
+  Data$signal.Div.lag <- case_when(Data$Div_Change  > 0  ~ -1, Data$Div_Change < 0  ~ 1, TRUE ~ 0)
+  Data$signal.Div.lag <-  stats::lag(Data$signal.Div.lag, k = div_lag)
+  Data$signal.Div.lag <- na.fill(Data$signal.Div.lag, fill = 0)
+  
+  Data$signal.Div <- Data$signal.Div + Data$signal.Div.lag
+  Data$signal.Int <- Data$signal.Int + Data$signal.Int.lag
+
+  Data <- subset(Data, select = -c(signal.Div.lag, signal.Int.lag))
+  
+  #Trade Execution
+  Data$trade <- stats::lag(Data$signal.Div) + stats::lag(Data$signal.Int)
+  Data$trade <- na.fill(Data$trade, fill = 0)
+  Data$pos <- cumsum(Data$trade)
+  
+  #PL Computation
+  Data$ret_new <-
+  ifelse(Data$pos == Data$trade , Data$pos * Data$retOpCl, 0)
+  
+  Data$ret_exist <-
+  ifelse(Data$pos != 0 & Data$trade == 0, Data$pos * Data$retClCl, 0)
+  
+  Data$ret_others <-
+  ifelse((Data$pos - Data$trade) != 0 & Data$trade != 0,
+         (1 + Data$retClOp * (Data$pos - Data$trade)) * (1 + Data$retOpCl * Data$pos) - 1,0)
+  
+  Data$ret <- Data$ret_new + Data$ret_exist + Data$ret_others
+  
+  Data$cumpl <- cumprod(1 + Data$ret) - 1
+  
+  return(Data)
+}
+```
+
+
+
+```{r Optimization, eval=FALSE, include=FALSE}
+# Detect the number of cores
+n_cores <- detectCores() - 1
+# Assign cores and open the cluster
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+out <- expand.grid(
+  div_lead = 11:0,
+  div_lag = 58:68,
+  int_lead = 5:1,
+  int_lag = 0:5
+)
+
+# Run strategy across all combinations
+res <- foreach(
+  i = 1:nrow(out),
+  .combine = "cbind",
+  .packages = c("tidyverse", "RTL", "timetk","tidyquant", "PerformanceAnalytics")
+) %dopar% {
+  as.numeric(RTL::tradeStats(
+    strategy(Data = WFC.train, div_lead = out[i, "div_lead"], div_lag = out[i, "div_lag"],
+             int_lead = out[i, "int_lead"], int_lag = out[i, "int_lag"])$ret))
+}
+# Stop the cluster
+stopCluster(cl)
+
+# Create tibble of results
+res <- tibble::as_tibble(t(res))
+stats.names <-
+  names(RTL::tradeStats(strategy(Data = WFC.train, div_lead = out[1, "div_lead"], div_lag = out[1, "div_lag"],
+             int_lead = out[1, "int_lead"], int_lag = out[1, "int_lag"])$ret))
+
+colnames(res) <- stats.names
+out <- cbind(out, res)
+out
+
+#write.csv(out, "Optimal.csv")
+```
+
+### Opitmization
+We will optimize the `div_lead`, `div_lag`, `int_lead` and `int_lag` parameters. These parameters have been described above. 
+
++ div_lead will iterate between 0 to 11
++ div_lag will iterate between 58 to 68
++ int_lead will iterate between 1 to 5
++ int_lag will iterate between 0 to 5
+
+The optimization will generate 4620 models.
+
+
+### Risk Appetite
+In order to select the optimal parameters, we firstly consider the win rate of the model. Only models that have more than 50% win rate are selected in this regard. This enables us to select models that can give us more wins which then translates in likely profits. Afterwards, we rank the remaining models according to their omega values from the highest to lowest. The omega criteria is used to enable us select models that present the lowest risk with highest returns. The number one ranked model parameter values are then selected as the optimal model parameters.  
+
+```{r Risk Appetite, eval=FALSE, include=FALSE, paged.print=TRUE}
+out <- read.csv("Optimal.csv")
+out %>% dplyr::filter(out["X..Win"] > 0.5) %>% 
+  dplyr::arrange(desc(Omega)) %>% head()
+```
+
+Based on our definition of risk appetite, we have our parameter values as follows:
+
++ div_lead    = 0,
++ div_lag     = 68,
++ int_lead    = 5,
++ int_lag     = 1
+
+### Performance
+
+The results below shows the performance of our model during the train period.
+```{r train, include=FALSE}
+WFC.train <- test.data(data = WFC, from = "1990-01-01" , to = "2014-12-01")
+
+train <- strategy(Data = WFC.train, div_lead = 0, div_lag = 68,  int_lead = 5, int_lag = 1)
+
+fig <- plot(train$Close, main = "Strategy Training Period")
+addSeries(
+  train$trade,
+  main = "Trades",
+  on = NA,
+  type = "h",
+  col = "blue",
+  lty = 1,
+  lwd = 1,
+  pch = 0
+)
+addSeries(
+  train$pos,
+  main = "Positions",
+  on = NA,
+  type = "h",
+  col = "blue",
+  lty = 1,
+  lwd = 1,
+  pch = 0
+)
+addSeries(
+  train$cumpl,
+  main = "CumPL",
+  on = NA,
+  type = "l",
+  col = "blue",
+  lty = 1,
+  lwd = 1,
+  pch = 0
+)
+```
+```{r echo=FALSE}
+RTL::tradeStats(train$ret) %>% as_tibble()
+fig
+```
+
+
+The cumulative return for our training period is 296%. Furthermore, we noted that prior to the 2008 financial crisis, our cumulative return peaked at approximately 500%. Our model performed well prior to 2008 because interest rate changes and regular declaration of dividends during the period helped us to capture more profits accordingly. However, after that period, interest rate remained unchanged and dividends although trending upward was maintained for more than one quarter. This affected the number of trades we could have entered and profit from the upward trend in prices.   
+
+### Testing Period
+To determine the viability of our trading model, we conduct backtesting. We use the test set as historical data for the walk forward approach.
+The results of the test will determine whether or not we have confidence in the model.   
+
+**Out-of-Sample Test**
+
+Using 80% of our data to train and holding 20% for testing the out-of-sample performance of our model.
+Similar to the bad, we run our model using the optimal parameters for the period indicated above and assess the performance metrics associated with or risk appetite.
+```{r OOT, include=FALSE}
+OOT <- test.data(data = WFC, from = "2014-12-02" , to = "2019-12-31")
+
+OOT <- strategy(Data = OOT, div_lead = 0, div_lag = 68,  int_lead = 5, int_lag = 1)
+
+fig <- plot(OOT$Close, main = "Out-of-Sample Test")
+addSeries(
+  OOT$trade,
+  main = "Trades",
+  on = NA,
+  type = "h",
+  col = "blue",
+  lty = 1,
+  lwd = 1,
+  pch = 0
+)
+addSeries(
+  OOT$pos,
+  main = "Positions",
+  on = NA,
+  type = "h",
+  col = "blue",
+  lty = 1,
+  lwd = 1,
+  pch = 0
+)
+addSeries(
+  OOT$cumpl,
+  main = "CumPL",
+  on = NA,
+  type = "l",
+  col = "blue",
+  lty = 1,
+  lwd = 1,
+  pch = 0
+)
+```
+
+```{r echo=FALSE}
+as_tibble(RTL::tradeStats(OOT$ret))
+fig
+```
+
+Our win rate during this period is slightly greater than 50% (50.22%) which satisfies our risk appetite. However, the cumulative return for the period is -9.8%. Our model worked pretty well to early 2018 when an increase in interest rate was associated with decline in WFC. Also the frequency of dividend changes was observed to be annual over the period. 
+
+
+### Robustness Test.
+We further conduct a robustness test on our model to determine how sensitive it is to a weak economy. Also, we test the models robustness on the  the SPDR S&P Regional Banking ETF (KRE) since the factors that model is based on are related to the financial services.
+
+**Bad Economy**
+  
+for 2 periods within our data set. We have the test for a recession period in the USA. That is the 2008 financial crisis which affected almost every sector of the USA economy. Also, the second backtesting period will cover a period of a boom economy. 
+
+We use the period between 01/12/2007 to 01/06/2009 as the 2008 financial crisis official dates extracted from [FRED](https://fredhelp.stlouisfed.org/fred/data/understanding-the-data/recession-bars/). 
+
+We run the model optimal parameters for the period stated above and derive the a plot visualizing the model performance. We also check for various measures such as the cumulative returns and omega value and win rate at the end of the period. 
+
+```{r Bad, include=FALSE}
+bad <- test.data(data = WFC, from = "2007-12-01" , to = "2009-06-01")
+
+Back.test.BAD <- strategy(Data = bad, div_lead = 0, div_lag = 68,  int_lead = 5, int_lag = 1)
+
+fig <- plot(Back.test.BAD$Close, main = "Backtesting for The 2008 Crisis Period")
+addSeries(
+  Back.test.BAD$trade,
+  main = "Trades",
+  on = NA,
+  type = "h",
+  col = "blue",
+  lty = 1,
+  lwd = 1,
+  pch = 0
+)
+addSeries(
+  Back.test.BAD$pos,
+  main = "Positions",
+  on = NA,
+  type = "h",
+  col = "blue",
+  lty = 1,
+  lwd = 1,
+  pch = 0
+)
+addSeries(
+  Back.test.BAD$cumpl,
+  main = "CumPL",
+  on = NA,
+  type = "l",
+  col = "blue",
+  lty = 1,
+  lwd = 1,
+  pch = 0
+)
+```
+```{r echo=FALSE}
+as_tibble(RTL::tradeStats(Back.test.BAD$ret))
+fig
+```
+
+Our win rate during this period is over 50% which satisfies our risk appetite. However, our omega value (0.0875) is below our training data omega value of 0.1241 with a cumulative return of 3.36%. Our model works well in the period especially because the market responded to interest rate changes as we expected.
+
+**SPDR S&P Regional Banking ETF (KRE)**
+
+The SPDR S&P Regional Banking ETF (KRE) represents the regional banks segment of the S&P 500. We use the KRE as a stock to test the robustness of our model since the Wells Fargo is a bank in the US. We test for the performance of our model between 01/01/2020 to date.
+```{r KRE, include=FALSE}
+d <- format(Sys.Date(),"%Y-%m-%d")
+stock <- "KRE"
+
+#Get WFC OHLC data
+df.stock <- tq_get(stock, "stock.prices",
+               from = "1990-01-01") %>%
+  dplyr::rename_all(tools::toTitleCase) %>% 
+  timetk::tk_xts(date_var = Date)
+
+#Adjust OHLC prices
+quantmod::getSymbols(stock)
+df.stock <- quantmod::adjustOHLC(df.stock, use.Adjusted = T)
+
+#Get dividend data
+df.dividend <- tq_get(stock, "dividends",
+               from = "1990-01-01") %>% 
+  dplyr::rename(Dividend = value) %>% 
+  dplyr::select(-symbol) %>% 
+  timetk::tk_xts(date_var = Date)
+
+#Merge all 3 dataset
+KRE.df <- df.stock %>% merge.xts(df.dividend, join = "outer") %>% 
+  merge.xts(df.int, join = "left")
+KRE.df <- zoo::na.locf(KRE.df)
+KRE.df <-zoo::na.trim(KRE.df)
+
+KRE.df <- test.data(data = KRE.df, from = "2020-01-01" , to = d)
+
+KRE <- strategy(Data = KRE.df, div_lead = 0, div_lag = 68,  int_lead = 5, int_lag = 1)
+
+fig <- plot(KRE$Close, main = "SPDR S&P Regional Banking ETF")
+addSeries(
+  KRE$trade,
+  main = "Trades",
+  on = NA,
+  type = "h",
+  col = "blue",
+  lty = 1,
+  lwd = 1,
+  pch = 0
+)
+addSeries(
+  KRE$pos,
+  main = "Positions",
+  on = NA,
+  type = "h",
+  col = "blue",
+  lty = 1,
+  lwd = 1,
+  pch = 0
+)
+addSeries(
+  KRE$cumpl,
+  main = "CumPL",
+  on = NA,
+  type = "l",
+  col = "blue",
+  lty = 1,
+  lwd = 1,
+  pch = 0
+)
+```
+
+```{r echo=FALSE}
+as_tibble(RTL::tradeStats(KRE$ret))
+fig
+```
+
+Our win rate during this period is over 50% (51.5%) which satisfies our risk appetite. However, our omega value (0.151) is above our training data omega value of 0.1241 with a cumulative return of 55.6%. The model works well in this market also due to the frequency of dividend changes.
+
+**Current Period Results**
+
+We further test the performance of our model between 01/01/2020 to date. We observe that the period in reference constitute effects of COVID-19 and an economy recovering from a recession. 
+```{r Recent, include=FALSE}
+recent <- test.data(data = WFC, from = "2020-01-01" , to = d)
+
+Recent <- strategy(Data = recent, div_lead = 0, div_lag = 68,  int_lead = 5, int_lag = 1)
+
+fig <- plot(Recent$Close, main = "Strategy Results From January 2020")
+addSeries(
+  Recent$trade,
+  main = "Trades",
+  on = NA,
+  type = "h",
+  col = "blue",
+  lty = 1,
+  lwd = 1,
+  pch = 0
+)
+addSeries(
+  Recent$pos,
+  main = "Positions",
+  on = NA,
+  type = "h",
+  col = "blue",
+  lty = 1,
+  lwd = 1,
+  pch = 0
+)
+addSeries(
+  Recent$cumpl,
+  main = "CumPL",
+  on = NA,
+  type = "l",
+  col = "blue",
+  lty = 1,
+  lwd = 1,
+  pch = 0
+)
+```
+
+The cumulative return of the model is *`r RTL::tradeStats(Recent$ret)["CumReturn"]`* compared to a buy and hold strategy, we get a cumulative return of *`r as.numeric(xts::last(quantmod::Cl(Recent))) / as.numeric(xts::first(quantmod::Cl(Recent)))`* which suggests that a buy and hold will be more profitable during the reference period. However, following our risk appetite, our win rate is above 50% and we have an omega greater than the training period omega value.
+
+Expect for the frequency of dividend and interest rate changes, our model is able to capture changes in the price of WFC as expected.  
+
+```{r echo=FALSE}
+as_tibble(RTL::tradeStats(Recent$ret))
+fig
+```
+
+#### Learnings
+During the study the following learnings were realized.
+
+1. We learn that time is very sensitivity factor in trading. Our model is setup to capture the optimal days to enter and exit a trade when certain changes are observed. What we observe is that, when we deviate from our optimal time by a day, our results changes significantly. The take away from this observation is that we should not underestimate the effect time has on our PnL.
+
+1. The model does not always work especially when historical pattern changes during implementation period. This was observed in our model between 2015 to 2019. The take away from this observation is that we should not over rely on the model. Also, we can take determine the state of the economy in which a particular model works well and apply it accordingly 
+
+1. Interest rate, one of the signals used for generating trade did not always provide the intended results as expected. We noted that when interest rates decrease, the expectation of the stock falling was not always true. We learnt from this observation that banks are reluctant to reduce their interest rates when the FED reduces the federal funds target rate. Therefore, our theory of decreasing earnings as a result of decreasing interest rates does not always hold.
+
+1. Although the signals used are able to capture some gains in the market, because trades are determined by changes in dividends and interest rate, in the case where dividend is declared but remain unchanged from the previous quarter, we fail to enter a trade. Also, when the frequency of dividends declaration is low it reduces the number of times we enter a trade. By extension, we are unable to profit from staying in the market during good times. Therefore, in order to make the most out of this strategy, we need to augment with other strategies. 
+
+1. Model selection decision can be extended to test set. This will enable us select a more robust model that will succeed with unseen data. 
+
+
+#### Setup in TidyVerse
+The results below shows the last 10 observations of running our model with tidyverse for the training period.
+
+```{r TidyVerse, echo=FALSE}
+window <- c(from = "1990-01-01", to = "2014-12-01")
+stock <- "WFC"
+int <- c( "DFEDTAR","DFEDTARU") 
+
+#Get WFC OHLC data
+getSymbols(stock,
+           from = window[1],
+           src = "yahoo")
+
+df.stock.td <- quantmod::adjustOHLC(WFC, use.Adjusted = T) %>% fortify.zoo() %>% as_tibble() %>% rename(date = Index) %>% rename_all(funs(str_replace_all(., "WFC.", "")))
+
+
+#Get dividend data
+df.dividend.td <- tq_get(stock, "dividends",
+               from = "1989-11-27") %>% #Use different date to get initial dividend Value
+  dplyr::rename(Dividend = value) %>% 
+  dplyr::select(-symbol)
+
+
+#Get Federal Funds rate from FRED
+df.int.td <- tq_get(int, "economic.data",
+               from = window[1]) %>%
+  dplyr::rename(Interest = price) %>% 
+  dplyr::select(-symbol) 
+
+#Merge all 3 dataset
+WFC.td <- df.stock.td %>% full_join(df.dividend.td, by = "date") %>% 
+  left_join(df.int.td, by = "date") %>%
+  arrange(date) %>%  tidyr::fill(c(Dividend,Interest)) %>% 
+  stats::na.omit() %>% as_tsibble(index = date)
+
+# Subset Training Set
+WFC.train.td <-  WFC.td %>% dplyr::filter(date >=  window["from"], date <= window["to"]) %>% 
+  dplyr::mutate(retClCl = (Close/dplyr::lag(Close))-1,
+                retOpCl = (Close/Open)-1,
+                retClOp = (Open/dplyr::lag(Close))-1) %>% 
+  #Signal Indicators
+  dplyr::mutate(Div_Change = (Dividend/dplyr::lag(Dividend))-1,
+                Int_Change = (Interest/dplyr::lag(Interest))-1,
+                signal.Div = case_when(dplyr::lead(Div_Change, n = 0) > 0  ~ 1, dplyr::lead(Div_Change, n = 0) < 0  ~ -1, TRUE ~ 0),
+                signal.Div.lag = case_when(Div_Change  > 0  ~ -1, Div_Change < 0  ~ 1, TRUE ~ 0),
+                signal.Div.lag = dplyr::lag(signal.Div.lag, n = 68),
+                
+                signal.Int = case_when(dplyr::lead(Int_Change, n = 5) > 0  ~ 1, dplyr::lead(Int_Change, n = 5) < 0  ~ -1, TRUE ~ 0),
+                signal.Int.lag = case_when(Int_Change  > 0  ~ -1, Int_Change < 0  ~ 1, TRUE ~ 0),
+                signal.Int.lag = dplyr::lag(signal.Int.lag, n = 1),
+                signal.Div = signal.Div + signal.Div.lag,
+                signal.Int = signal.Int + signal.Int.lag) %>%
+  dplyr::select(-c(signal.Int.lag, signal.Div.lag)) %>% 
+  
+  #Trade Execution
+  dplyr::mutate(trade = dplyr::lag(signal.Div) + dplyr::lag(signal.Int),
+                trade = replace_na(trade, 0),
+                pos = cumsum(trade)
+  ) %>% 
+  
+  #PL Computation
+  dplyr::mutate(ret_new = case_when(pos==trade ~ pos*retOpCl, TRUE ~ 0),
+                ret_exist = case_when(pos != 0 & trade == 0 ~ pos*retClCl, TRUE ~ 0),
+                ret_others = case_when((pos-trade) != 0 & trade != 0 ~ (1 + retClOp*(pos-trade)) * (1 + retOpCl*pos) - 1, TRUE ~ 0),
+                ret = ret_new + ret_exist + ret_others,
+                cumpl = cumprod(1 + ret) - 1
+  )
+
+WFC.train.td %>% dplyr::select(c(date, retClCl, retOpCl, retClOp, signal.Div, signal.Int, trade, pos, cumpl)) %>% tail(10)
+```
+We compare the results to running the model with our strategy function built in xts below.
+
+```{r echo=FALSE}
+tail(train, 10)
+```
+
+
+
